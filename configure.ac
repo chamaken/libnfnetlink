@@ -24,6 +24,8 @@ esac
 
 
 dnl--------------------------------
+dnl Check for the right libmnl version
+PKG_CHECK_MODULES([LIBMNL], [libmnl >= 1.0])
 dnl--------------------------------
 
 

@@ -52,6 +52,8 @@
 
 #include <libnfnetlink/libnfnetlink.h>
 
+#include <libmnl/libmnl.h>
+
 #ifndef NETLINK_ADD_MEMBERSHIP
 #define NETLINK_ADD_MEMBERSHIP 1
 #endif
@@ -83,8 +85,7 @@ struct nfnl_subsys_handle {
 #define NFNL_F_SEQTRACK_ENABLED		(1 << 0)
 
 struct nfnl_handle {
-	int			fd;
-	struct sockaddr_nl	local;
+	struct mnl_socket	*mnlsk;
 	struct sockaddr_nl	peer;
 	u_int32_t		subscriptions;
 	u_int32_t		seq;
@@ -129,7 +130,7 @@ void nfnl_dump_packet(struct nlmsghdr *nlh, int received_len, char *desc)
 int nfnl_fd(struct nfnl_handle *h)
 {
 	assert(h);
-	return h->fd;
+	return mnl_socket_get_fd(h->mnlsk);
 }
 
 /**
@@ -139,7 +140,7 @@ int nfnl_fd(struct nfnl_handle *h)
 unsigned int nfnl_portid(const struct nfnl_handle *h)
 {
 	assert(h);
-	return h->local.nl_pid;
+	return mnl_socket_get_portid(h->mnlsk);
 }
 
 static int recalc_rebind_subscriptions(struct nfnl_handle *nfnlh)
@@ -150,9 +151,7 @@ static int recalc_rebind_subscriptions(struct nfnl_handle *nfnlh)
 	for (i = 0; i < NFNL_MAX_SUBSYS; i++)
 		new_subscriptions |= nfnlh->subsys[i].subscriptions;
 
-	nfnlh->local.nl_groups = new_subscriptions;
-	err = bind(nfnlh->fd, (struct sockaddr *)&nfnlh->local,
-		   sizeof(nfnlh->local));
+	err = mnl_socket_bind(nfnlh->mnlsk, new_subscriptions, MNL_SOCKET_AUTOPID);
 	if (err == -1)
 		return -1;
 
@@ -174,53 +173,46 @@ struct nfnl_handle *nfnl_open(void)
 {
 	struct nfnl_handle *nfnlh;
 	unsigned int addr_len;
+	struct sockaddr_nl local;
 
 	nfnlh = malloc(sizeof(*nfnlh));
 	if (!nfnlh)
 		return NULL;
 
 	memset(nfnlh, 0, sizeof(*nfnlh));
-	nfnlh->fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_NETFILTER);
-	if (nfnlh->fd == -1)
+	nfnlh->mnlsk = mnl_socket_open(NETLINK_NETFILTER);
+	if (nfnlh->mnlsk == NULL);
 		goto err_free;
 
-	nfnlh->local.nl_family = AF_NETLINK;
 	nfnlh->peer.nl_family = AF_NETLINK;
 
-	addr_len = sizeof(nfnlh->local);
-	getsockname(nfnlh->fd, (struct sockaddr *)&nfnlh->local, &addr_len);
-	if (addr_len != sizeof(nfnlh->local)) {
+	addr_len = sizeof(local);
+	getsockname(mnl_socket_get_fd(nfnlh->mnlsk), (struct sockaddr *)&local, &addr_len);
+	if (addr_len != sizeof(local)) {
 		errno = EINVAL;
 		goto err_close;
 	}
-	if (nfnlh->local.nl_family != AF_NETLINK) {
+	if (local.nl_family != AF_NETLINK) {
 		errno = EINVAL;
 		goto err_close;
 	}
 	nfnlh->seq = time(NULL);
 	nfnlh->rcv_buffer_size = NFNL_BUFFSIZE;
 
-	/* don't set pid here, only first socket of process has real pid !!! 
-	 * binding to pid '0' will default */
-
-	/* let us do the initial bind */
+	/* let us do the initial bind.
+	 * the netlink pid that the kernel assigied us will be set
+	 * in recalc_rebind_subscriptions() by mnl_socket_bind()
+	 */
 	if (recalc_rebind_subscriptions(nfnlh) < 0)
 		goto err_close;
 
-	/* use getsockname to get the netlink pid that the kernel assigned us */
-	addr_len = sizeof(nfnlh->local);
-	getsockname(nfnlh->fd, (struct sockaddr *)&nfnlh->local, &addr_len);
-	if (addr_len != sizeof(nfnlh->local)) {
-		errno = EINVAL;
-		goto err_close;
-	}
 	/* sequence tracking enabled by default */
 	nfnlh->flags |= NFNL_F_SEQTRACK_ENABLED;
 
 	return nfnlh;
 
 err_close:
-	close(nfnlh->fd);
+	mnl_socket_close(nfnlh->mnlsk);
 err_free:
 	free(nfnlh);
 	return NULL;
@@ -345,7 +337,7 @@ int nfnl_close(struct nfnl_handle *nfnlh)
 	for (i = 0; i < NFNL_MAX_SUBSYS; i++)
 		nfnl_subsys_close(&nfnlh->subsys[i]);
 
-	ret = close(nfnlh->fd);
+	ret = mnl_socket_close(nfnlh->mnlsk);
 	if (ret < 0)
 		return ret;
 
@@ -369,8 +361,8 @@ int nfnl_close(struct nfnl_handle *nfnlh)
 int nfnl_join(const struct nfnl_handle *nfnlh, unsigned int group)
 {
 	assert(nfnlh);
-	return setsockopt(nfnlh->fd, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP,
-			  &group, sizeof(group));
+	return mnl_socket_setsockopt(nfnlh->mnlsk, NETLINK_ADD_MEMBERSHIP,
+				     &group, sizeof(group));
 }
 
 /**
@@ -388,7 +380,7 @@ int nfnl_send(struct nfnl_handle *nfnlh, struct nlmsghdr *n)
 
 	nfnl_debug_dump_packet(n, n->nlmsg_len+sizeof(*n), "nfnl_send");
 
-	return sendto(nfnlh->fd, n, n->nlmsg_len, 0, 
+	return sendto(mnl_socket_get_fd(nfnlh->mnlsk), n, n->nlmsg_len, 0, 
 		      (struct sockaddr *)&nfnlh->peer, sizeof(nfnlh->peer));
 }
 
@@ -398,7 +390,7 @@ int nfnl_sendmsg(const struct nfnl_handle *nfnlh, const struct msghdr *msg,
 	assert(nfnlh);
 	assert(msg);
 
-	return sendmsg(nfnlh->fd, msg, flags);
+	return sendmsg(mnl_socket_get_fd(nfnlh->mnlsk), msg, flags);
 }
 
 int nfnl_sendiov(const struct nfnl_handle *nfnlh, const struct iovec *iov,
@@ -519,8 +511,8 @@ nfnl_recv(const struct nfnl_handle *h, unsigned char *buf, size_t len)
 	}
 
 	addrlen = sizeof(h->peer);
-	status = recvfrom(h->fd, buf, len, 0, (struct sockaddr *)&peer,	
-			&addrlen);
+	status = recvfrom(mnl_socket_get_fd(h->mnlsk), buf, len, 0,
+			  (struct sockaddr *)&peer, &addrlen);
 	if (status <= 0)
 		return status;
 
@@ -584,7 +576,7 @@ int nfnl_listen(struct nfnl_handle *nfnlh,
 	iov.iov_len = sizeof(buf);
 
 	while (! quit) {
-		remain = recvmsg(nfnlh->fd, &msg, 0);
+		remain = recvmsg(mnl_socket_get_fd(nfnlh->mnlsk), &msg, 0);
 		if (remain < 0) {
 			if (errno == EINTR)
 				continue;
@@ -687,6 +679,8 @@ int nfnl_talk(struct nfnl_handle *nfnlh, struct nlmsghdr *n, pid_t peer,
 		.msg_iov     = &iov,
 		.msg_iovlen  = 1,
 	};
+	int fd = mnl_socket_get_fd(nfnlh->mnlsk);
+	unsigned int local_pid = nfnl_portid(nfnlh);
 
 	memset(&nladdr, 0, sizeof(nladdr));
 	nladdr.nl_family = AF_NETLINK;
@@ -698,7 +692,7 @@ int nfnl_talk(struct nfnl_handle *nfnlh, struct nlmsghdr *n, pid_t peer,
 	if (!answer)
 		n->nlmsg_flags |= NLM_F_ACK;
 
-	status = sendmsg(nfnlh->fd, &msg, 0);
+	status = sendmsg(fd, &msg, 0);
 	if (status < 0) {
 		nfnl_error("sendmsg(netlink) %s", strerror(errno));
 		return -1;
@@ -707,7 +701,7 @@ int nfnl_talk(struct nfnl_handle *nfnlh, struct nlmsghdr *n, pid_t peer,
 	iov.iov_len = sizeof(buf);
 
 	while (1) {
-		status = recvmsg(nfnlh->fd, &msg, 0);
+		status = recvmsg(fd, &msg, 0);
 		if (status < 0) {
 			if (errno == EINTR)
 				continue;
@@ -738,7 +732,7 @@ int nfnl_talk(struct nfnl_handle *nfnlh, struct nlmsghdr *n, pid_t peer,
 				return -1; /* FIXME: libnetlink exits here */
 			}
 
-			if (h->nlmsg_pid != nfnlh->local.nl_pid ||
+			if (h->nlmsg_pid != local_pid ||
 			    h->nlmsg_seq != seq) {
 				if (junk) {
 					err = junk(&nladdr, h, jarg);
@@ -1014,19 +1008,19 @@ unsigned int nfnl_rcvbufsiz(const struct nfnl_handle *h, unsigned int size)
 	int status;
 	socklen_t socklen = sizeof(size);
 	unsigned int read_size = 0;
-
+	int fd = mnl_socket_get_fd(h->mnlsk);
 	assert(h);
 
 	/* first we try the FORCE option, which is introduced in kernel
 	 * 2.6.14 to give "root" the ability to override the system wide
 	 * maximum */
-	status = setsockopt(h->fd, SOL_SOCKET, SO_RCVBUFFORCE, &size, socklen);
+	status = setsockopt(fd, SOL_SOCKET, SO_RCVBUFFORCE, &size, socklen);
 	if (status < 0) {
 		/* if this didn't work, we try at least to get the system
 		 * wide maximum (or whatever the user requested) */
-		setsockopt(h->fd, SOL_SOCKET, SO_RCVBUF, &size, socklen);
+		setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, socklen);
 	}
-	getsockopt(h->fd, SOL_SOCKET, SO_RCVBUF, &read_size, &socklen);
+	getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &read_size, &socklen);
 
 	return read_size;
 }
