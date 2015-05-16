@@ -27,10 +27,10 @@
 struct ifindex_node {
 	struct list_head head;
 
-	u_int32_t	index;
-	u_int32_t	type;
-	u_int32_t	alen;
-	u_int32_t	flags;
+	uint32_t	index;
+	uint32_t	type;
+	uint32_t	alen;
+	uint32_t	flags;
 	char		addr[8];
 	char		name[16];
 };
