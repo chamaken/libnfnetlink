@@ -15,8 +15,6 @@ include ()
     	echo "Copying nfnetlink.h to linux_nfnetlink.h"
     	cp $INCLUDEDIR/netfilter/nfnetlink.h $TARGET
 	TMP=`mktemp`
-	sed 's/__be16/uint16_t/g' $TARGET > $TMP
-	cp $TMP $TARGET
 	sed 's/#include <linux\/netfilter\/nfnetlink_compat\.h>/#include <libnfnetlink\/linux_nfnetlink_compat\.h>/g' $TARGET > $TMP
 	cp $TMP $TARGET
     else
